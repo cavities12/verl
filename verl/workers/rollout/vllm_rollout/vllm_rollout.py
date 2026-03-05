@@ -145,7 +145,7 @@ class ServerAdapter(BaseRollout):
         if self.config.free_cache_engine:
             await self._execute_method("wake_up", kwargs={"tags": tags})
 
-    async def release(self):
+    async def release(self, tags: list[str] | None = None):
         """Release weights and kv cache in GPU memory."""
         if self.config.free_cache_engine:
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})

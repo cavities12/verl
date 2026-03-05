@@ -610,6 +610,126 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
     return lora_params
 
 
+def merge_lora_weights(fsdp_module) -> OrderedDict:
+    """Extract full merged weights (base + LoRA) layer by layer for SGLang rollout.
+
+    SGLang's SglangRollout.update_weights() ignores peft_config and base_sync_done
+    (**kwargs captured, never used) and always calls model.load_weights() which expects
+    HuggingFace key names. Sending LoRA delta keys (peft format) fails with KeyError.
+
+    This function merges LoRA into base weights and returns the full model state dict
+    with clean HF names. SGLang's load_weights() handles QKV/gate_up fusion
+    automatically (e.g. q_proj -> qkv_proj shard 0).
+
+    Memory-efficient: processes one FSDP-wrapped module at a time.
+    For FSDP2: uses FSDPModule.unshard()/reshard() (the native FSDP2 API).
+      FSDP1's summon_full_params is a silent no-op on FSDP2 modules because
+      the class hierarchies are separate (_FSDPState vs FSDPState).
+    For FSDP1: uses FSDP.summon_full_params(writeback=False).
+    """
+    import logging
+
+    from peft.tuners.lora.layer import LoraLayer
+
+    logger = logging.getLogger(__name__)
+
+    def _prefix_submodules(module, prefix):
+        for name, submodule in module.named_modules():
+            if name.startswith(prefix) and "." not in name[len(prefix) :]:
+                yield name, submodule
+
+    merged_params = OrderedDict()
+    visited = set()
+
+    # Prefixes ordered narrow-first to avoid OOM from broad prefixes.
+    # Narrow prefixes (individual layers) are processed first; broad
+    # prefixes (model-level containers) are skipped via visited set.
+    prefix_list = [
+        # FSDP1 (with _fsdp_wrapped_module prefix)
+        "_fsdp_wrapped_module.base_model.model.model.layers.",
+        "_fsdp_wrapped_module.base_model.model.model.language_model.layers.",
+        "_fsdp_wrapped_module.base_model.model.model.",
+        "_fsdp_wrapped_module.base_model.model.",
+        # FSDP2 (no _fsdp_wrapped_module)
+        "base_model.model.model.layers.",
+        "base_model.model.model.language_model.layers.",
+        "base_model.model.model.",
+        "base_model.model.",
+    ]
+
+    for prefix in prefix_list:
+        for name, submodule in _prefix_submodules(fsdp_module, prefix):
+            if name.endswith(".model") or name.endswith(".layers"):
+                continue
+            if id(submodule) in visited:
+                continue
+
+            ver = fsdp_version(submodule)
+            if ver == 0:
+                continue
+            visited.add(id(submodule))
+
+            if ver == 2:
+                # FSDP2: use native unshard()/reshard() API.
+                # summon_full_params is a no-op for FSDP2 (separate class hierarchies).
+                submodule.unshard()
+                fsdp1_ctx = None
+            else:
+                # FSDP1 fallback
+                fsdp1_ctx = FSDP.summon_full_params(submodule, writeback=False)
+                fsdp1_ctx.__enter__()
+
+            try:
+                # Merge LoRA into base weights
+                with torch.no_grad():
+                    for m in submodule.modules():
+                        if isinstance(m, LoraLayer) and hasattr(m, "merge"):
+                            m.merge()
+
+                try:
+                    for pname, param in submodule.state_dict().items():
+                        if "lora_" in pname or "_flat_param" in pname:
+                            continue
+
+                        val = (
+                            param.full_tensor().detach().cpu()
+                            if hasattr(param, "full_tensor")
+                            else param.detach().cpu()
+                        )
+
+                        # Build full key and clean to HuggingFace format:
+                        # 1. Strip _fsdp_wrapped_module (FSDP1 wrapper)
+                        # 2. Strip base_model.model. (peft wrapper)
+                        # 3. Strip .base_layer (peft wraps target modules)
+                        full_key = f"{name}.{pname}"
+                        full_key = full_key.replace("_fsdp_wrapped_module.", "")
+                        full_key = full_key.replace("base_model.model.", "")
+                        full_key = full_key.replace(".base_layer", "")
+                        merged_params[full_key] = val
+                finally:
+                    # Unmerge to restore peft's internal state even if extraction fails
+                    with torch.no_grad():
+                        for m in submodule.modules():
+                            if isinstance(m, LoraLayer) and hasattr(m, "unmerge"):
+                                m.unmerge()
+            finally:
+                if ver == 2:
+                    submodule.reshard()
+                elif fsdp1_ctx is not None:
+                    fsdp1_ctx.__exit__(None, None, None)
+
+            get_torch_device().empty_cache()
+
+    if len(merged_params) == 0:
+        raise RuntimeError(
+            "merge_lora_weights returned 0 params — prefix patterns may not match this model architecture"
+        )
+
+    logger.info("merge_lora_weights: extracted %d params", len(merged_params))
+
+    return merged_params
+
+
 def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool) -> OrderedDict:
     """
     collect lora params or full params if base model is not ready in vllm

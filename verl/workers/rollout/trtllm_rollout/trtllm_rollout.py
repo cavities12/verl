@@ -354,11 +354,12 @@ class ServerAdapter(BaseRollout):
             await self._init_server_adapter()
             await self._adapter.resume_memory_occupation(tags=tags)
 
-    async def release(self):
+    async def release(self, tags: list[str] | None = None):
         """Release weights and kv cache in GPU memory."""
         if self.is_leader_rank and self.config.free_cache_engine:
             await self._init_server_adapter()
-            tags = self._WEIGHTS_TAGS + ["kv_cache"]
+            if tags is None:
+                tags = self._WEIGHTS_TAGS + ["kv_cache"]
             await self._adapter.release_memory_occupation(tags=tags)
 
     async def update_weights_from_ipc_handles(self, device_handles):

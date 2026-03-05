@@ -72,6 +72,7 @@ from verl.utils.fsdp_utils import (
     layered_summon_lora_params,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
+    merge_lora_weights,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
     replace_lora_wrapper,
@@ -750,15 +751,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        try:
+            from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter as SglangServerAdapter
+
+            is_sglang = isinstance(self.rollout, SglangServerAdapter)
+        except ImportError:
+            is_sglang = False
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            if is_sglang:
+                # SGLang's update_weights() ignores peft_config/base_sync_done (**kwargs)
+                # and always calls model.load_weights() expecting HF key names.
+                # Merge LoRA into base and extract with clean HF names.
+                params = merge_lora_weights(self.actor_module_fsdp)
+                # Force base_sync_done=True: merge_lora_weights returns CPU tensors
+                # with full merged weights. The non-base_sync_done path only moves
+                # DTensors to GPU — CPU tensors would pass through to SGLang's CUDA
+                # IPC serializer, corrupting weights.
+                self.base_sync_done = True
+            else:
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -771,8 +789,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # separately collect and update LoRA weights and base model weights through their respective interfaces.
         # Here: params contains LoRA weights, base_model_params contains base model weights.
         # Only needed if the rollout engine actually sleeps/frees weights (free_cache_engine=True).
+        # Skip for SGLang: merge_lora_weights already returns the full merged model
+        # (base + LoRA), so there's no need to separately sync base weights.
         if (
             peft_config is not None
+            and not is_sglang
             and getattr(self.rollout, "sleep_level", None) == 2
             and self.config.rollout.free_cache_engine
         ):
@@ -794,7 +815,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
 
         if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+            if is_sglang:
+                # merge_lora_weights returns CPU tensors. SGLang's CUDA IPC serializer
+                # expects GPU tensors — CPU tensors have a different pickle structure,
+                # causing "IndexError: tuple index out of range".
+                # Use non_blocking=False to ensure tensors are fully on GPU before
+                # SGLang reads them (non_blocking=True caused garbage output from
+                # partially-copied memory).
+                device = get_device_id()
+                per_tensor_param = [(k, v.to(device, non_blocking=False) if v.is_cpu else v) for k, v in params.items()]
+            else:
+                per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
@@ -825,6 +856,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if (
             peft_config is not None
+            and not is_sglang
             and getattr(self.rollout, "sleep_level", None) == 2
             and self.config.rollout.free_cache_engine
         ):
@@ -837,6 +869,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
         log_gpu_memory_usage("After update_weights", logger=logger)
+
+        # Resync torch_memory_saver's CPU backup after update_weights.
+        # When free_cache_engine=True, torch_memory_saver maintains a CPU backup of
+        # model weights. The resume(tags=["weights"]) call above restores a STALE CPU
+        # backup to GPU, then update_weights() overwrites GPU params with correct
+        # merged weights. But the CPU backup is now stale — on the next training→rollout
+        # transition, resume("weights") would restore the stale backup, causing garbage
+        # output. Fix: round-trip the correct GPU weights through the CPU backup via
+        # release(weights) → resume(weights). Costs ~1-2s but ensures correctness.
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.release(tags=["weights"])
+            await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resync memory_saver backup", logger=logger)
+
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
