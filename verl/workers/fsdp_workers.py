@@ -805,9 +805,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 name,
                 param.to(device, non_blocking=True).full_tensor()
                 if isinstance(param, DTensor)
-                else param.to(device, non_blocking=False)
-                if param.is_cpu
-                else param,
+                else param.to(device, non_blocking=False),
             )
             for name, param in _items
         )
