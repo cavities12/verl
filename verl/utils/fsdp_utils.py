@@ -867,6 +867,7 @@ def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
                 key = key.replace("base_model.model.", "")
                 key = key.replace(".base_layer", "")
                 return key
+
             parent_fsdp_names = {n.rpartition(".")[0] for n, _ in fsdp_submodules if "." in n}
             for name, submodule in fsdp_submodules:
                 # A leaf FSDPModule is one that is not a parent to any other FSDPModule.
