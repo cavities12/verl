@@ -20,7 +20,6 @@ import os
 from typing import Any, Optional
 
 import ray
-import sglang
 import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
@@ -41,13 +40,14 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
+import sglang
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter, _set_envs_and_config
+from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 

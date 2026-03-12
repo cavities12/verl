@@ -56,7 +56,7 @@ import aiohttp
 import requests
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput, UpdateWeightsFromTensorReqInput
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
@@ -774,7 +774,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             },
         )
 
-    async def load_lora_adapter_from_tensor(self, req: LoadLoRAAdapterFromTensorsReqInput):
+    async def load_lora_adapter_from_tensor(self, req):
         return await self._make_async_request(
             "load_lora_adapter_from_tensors",
             {

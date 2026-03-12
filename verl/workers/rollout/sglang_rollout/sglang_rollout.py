@@ -22,12 +22,9 @@ from dataclasses import asdict
 from typing import Generator
 
 import ray
+import sglang.srt.entrypoints.engine
 import torch
 from peft import LoraConfig
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-
-import sglang.srt.entrypoints.engine
-from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -38,6 +35,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
@@ -232,6 +231,8 @@ class ServerAdapter(BaseRollout):
 
                 # load lora by tensor
                 serialize_peft_config, serialize_named_tensors = self.wrap_lora_params(peft_config, weights)
+                from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput
+
                 req = LoadLoRAAdapterFromTensorsReqInput(
                     lora_name=SGLANG_LORA_NAME,
                     config_dict=serialize_peft_config,
