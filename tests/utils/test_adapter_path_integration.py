@@ -21,11 +21,14 @@ Requires 1 GPU with sglang installed.
 """
 
 from dataclasses import asdict
+from importlib.util import find_spec
 
 import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+pytestmark = pytest.mark.skipif(find_spec("sglang") is None, reason="sglang not installed")
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 ADAPTER_NAME = "verl_lora_adapter"
